@@ -8,7 +8,10 @@ from typing import Optional
 from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 
-from models.schemas import FinancialData, FundamentalMetrics, ValuasiMetrics, RisikoAssessment
+from models.schemas import (
+    FinancialData, FundamentalMetrics, ValuasiMetrics, RisikoAssessment,
+    LabaRugi, Neraca, ArusKas,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +130,156 @@ class LLMAnalyzer:
                 ticker, metrics, valuasi, fundamental_score,
                 valuasi_score, keputusan, margin_of_safety
             )
+
+    def extract_financial_data(
+        self,
+        pdf_text: str,
+        ticker: str,
+        company_name: str,
+        sector: str,
+        year: int,
+        shares_outstanding: float = 0,
+    ) -> Optional[FinancialData]:
+        """
+        Ekstrak data keuangan TERSTRUKTUR dari teks PDF menggunakan Claude.
+        Lebih andal daripada parser regex karena Claude memahami konteks tabel,
+        skala satuan ('dalam jutaan/miliar Rupiah'), dan label yang bervariasi.
+
+        Returns FinancialData (semua nilai dalam Rupiah absolut) atau None jika gagal.
+        """
+        client = self._get_client()
+        if not client or not pdf_text or not pdf_text.strip():
+            return None
+
+        excerpt = pdf_text[:45000]
+        prompt = f"""Kamu adalah ekstraktor data laporan keuangan IDX. Dari teks laporan keuangan {ticker} ({company_name}) tahun {year} di bawah ini, ekstrak angka-angka berikut.
+
+ATURAN KETAT (ikuti definisi baris secara KONSISTEN, jangan berganti baris antar tahun):
+- Kembalikan SEMUA nilai dalam RUPIAH ABSOLUT. Jika laporan disajikan 'dalam jutaan Rupiah', kalikan 1.000.000; jika 'dalam ribuan', kalikan 1.000; jika dalam USD, tetap dalam USD dan set "currency":"USD".
+- Ambil nilai TAHUN BERJALAN ({year}), bukan tahun pembanding (kolom tahun sebelumnya).
+- net_profit = laba bersih yang DAPAT DIATRIBUSIKAN KE PEMILIK ENTITAS INDUK (bukan termasuk kepentingan non-pengendali).
+- interest_income: WAJIB pakai 'PENDAPATAN BUNGA BERSIH' / 'Pendapatan bunga dan syariah - bersih' (yaitu pendapatan bunga SETELAH dikurangi beban bunga). JANGAN gunakan pendapatan bunga BRUTO. Jika hanya tersedia bruto, hitung bersih = pendapatan bunga bruto - beban bunga.
+- interest_expense = beban bunga (dan syariah).
+- total_loans = kredit yang diberikan, nilai BRUTO (sebelum cadangan kerugian).
+- casa = giro + tabungan (current account + savings).
+- Nilai dalam tanda kurung = negatif.
+- Jika suatu pos TIDAK ditemukan dengan pasti, isi null (JANGAN menebak/mengarang).
+
+Kembalikan HANYA JSON valid (tanpa teks lain):
+{{
+  "currency": "IDR",
+  "net_profit": <angka|null>,
+  "revenue": <angka|null>,
+  "interest_income": <angka|null>,
+  "interest_expense": <angka|null>,
+  "gross_profit": <angka|null>,
+  "operating_profit": <angka|null>,
+  "total_assets": <angka|null>,
+  "total_equity": <angka|null>,
+  "total_liabilities": <angka|null>,
+  "total_loans": <angka|null>,
+  "casa": <angka|null>,
+  "current_assets": <angka|null>,
+  "current_liabilities": <angka|null>,
+  "cash_and_equiv": <angka|null>,
+  "npl_gross": <persen|null>,
+  "operating_cf": <angka|null>,
+  "investing_cf": <angka|null>,
+  "financing_cf": <angka|null>,
+  "capex": <angka|null>,
+  "shares_outstanding": <angka|null>
+}}
+
+TEKS LAPORAN KEUANGAN:
+---
+{excerpt}
+---"""
+
+        try:
+            logger.info(f"Ekstraksi data keuangan via Claude untuk {ticker} {year}...")
+            message = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1500,
+                temperature=0,  # deterministik — konsistensi antar tahun & antar run
+                system="Kamu ekstraktor data presisi. Hanya keluarkan JSON valid sesuai skema, tanpa penjelasan.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text
+            data = self._parse_llm_response(raw)
+            if not data or data.get("net_profit") is None and data.get("total_assets") is None:
+                logger.warning(f"Ekstraksi LLM {ticker} {year} kosong/tidak valid.")
+                return None
+
+            # Konversi USD → IDR jika perlu (pakai kurs dari pdf_parser via yfinance)
+            rate = 1.0
+            if str(data.get("currency", "IDR")).upper() == "USD":
+                try:
+                    from services.pdf_parser import PDFParser
+                    rate = PDFParser()._get_dynamic_exchange_rate(year)
+                except Exception:
+                    rate = 15500.0
+
+            def num(key):
+                v = data.get(key)
+                if v is None:
+                    return None
+                try:
+                    return float(v) * (rate if rate > 1.0 else 1.0)
+                except (TypeError, ValueError):
+                    return None
+
+            laba_rugi = LabaRugi(
+                year=year,
+                revenue=num("revenue"),
+                net_profit=num("net_profit"),
+                gross_profit=num("gross_profit"),
+                operating_profit=num("operating_profit"),
+                interest_income=num("interest_income"),
+                interest_expense=num("interest_expense"),
+            )
+            neraca = Neraca(
+                year=year,
+                total_assets=num("total_assets"),
+                total_equity=num("total_equity"),
+                total_liabilities=num("total_liabilities"),
+                total_loans=num("total_loans"),
+                casa=num("casa"),
+                current_assets=num("current_assets"),
+                current_liabilities=num("current_liabilities"),
+                cash_and_equiv=num("cash_and_equiv"),
+                npl_gross=data.get("npl_gross"),
+            )
+            arus_kas = ArusKas(
+                year=year,
+                operating_cf=num("operating_cf"),
+                investing_cf=num("investing_cf"),
+                financing_cf=num("financing_cf"),
+                capex=num("capex"),
+            )
+            if arus_kas.operating_cf is not None and arus_kas.capex is not None:
+                arus_kas.free_cash_flow = arus_kas.operating_cf - abs(arus_kas.capex)
+
+            llm_shares = data.get("shares_outstanding")
+            shares = shares_outstanding or (float(llm_shares) if llm_shares else 0) or None
+
+            logger.info(
+                f"Ekstraksi LLM {ticker} {year}: NetProfit={laba_rugi.net_profit}, "
+                f"TotalAssets={neraca.total_assets}, Equity={neraca.total_equity}"
+            )
+            return FinancialData(
+                ticker=ticker,
+                company_name=company_name or ticker,
+                sector=sector,
+                year=year,
+                laba_rugi=laba_rugi,
+                neraca=neraca,
+                arus_kas=arus_kas,
+                shares_outstanding=shares,
+                source_pdf_url="LLM extraction",
+            )
+        except Exception as e:
+            logger.error(f"Error ekstraksi LLM untuk {ticker} {year}: {e}", exc_info=True)
+            return None
 
     def _build_prompt(
         self,

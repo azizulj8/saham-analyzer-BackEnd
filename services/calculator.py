@@ -48,6 +48,83 @@ class CalculatorEngine:
             return None
         return ((end_value / start_value) ** (1 / years) - 1) * 100
 
+    def compute_valuation_baseline(
+        self,
+        financial_data_list: List[FinancialData],
+        year_end_prices: dict,
+        metrics: "FundamentalMetrics",
+        shares_outstanding: float = 0,
+        sector_per: float = 14.0,
+        min_years: int = 3,
+        cost_of_equity: float = 0.11,
+        long_term_growth: float = 0.04,
+    ) -> dict:
+        """
+        Tentukan baseline PER/PBV historis untuk penilaian valuasi (opsi C).
+
+        Hierarki:
+        1. HISTORIS EMITEN — jika tersedia >= min_years tahun: rata-rata PER/PBV
+           aktual per tahun = harga akhir tahun ÷ EPS/BVPS tahun tsb.
+        2. ROE-JUSTIFIED — anchor fundamental: PBV* = (ROE - g)/(CoE - g),
+           PER* = PBV* / ROE. Dipakai jika data historis kurang.
+        3. SEKTOR DEFAULT — rata-rata sektor (PER) + PBV 2.0 sebagai fallback akhir.
+
+        Returns dict: {per, pbv, method, years_used, assumptions}
+        """
+        pers, pbvs = [], []
+        for fd in financial_data_list:
+            sh = fd.shares_outstanding or shares_outstanding
+            price = year_end_prices.get(fd.year)
+            if not sh or not price:
+                continue
+            np_ = fd.laba_rugi.net_profit
+            eq = fd.neraca.total_equity
+            if np_ and np_ > 0:
+                eps = np_ / sh
+                if eps > 0:
+                    pers.append(price / eps)
+            if eq and eq > 0:
+                bvps = eq / sh
+                if bvps > 0:
+                    pbvs.append(price / bvps)
+
+        # 1. Historis emiten (paling kontekstual) — butuh cukup banyak tahun
+        if len(pers) >= min_years and len(pbvs) >= min_years:
+            return {
+                "per": round(sum(pers) / len(pers), 2),
+                "pbv": round(sum(pbvs) / len(pbvs), 2),
+                "method": "historis_emiten",
+                "years_used": len(pbvs),
+                "assumptions": None,
+            }
+
+        # 2. ROE-justified anchor (Gordon/residual income)
+        roe = metrics.roe
+        if roe:
+            roe_dec = abs(roe)
+            if roe_dec > 1:
+                roe_dec /= 100.0
+            if cost_of_equity > long_term_growth and roe_dec > 0:
+                justified_pbv = (roe_dec - long_term_growth) / (cost_of_equity - long_term_growth)
+                if justified_pbv > 0:
+                    justified_per = justified_pbv / roe_dec
+                    return {
+                        "per": round(justified_per, 2),
+                        "pbv": round(justified_pbv, 2),
+                        "method": "roe_justified",
+                        "years_used": len(pbvs),
+                        "assumptions": f"CoE={cost_of_equity:.0%}, g={long_term_growth:.0%}, ROE={roe_dec:.1%}",
+                    }
+
+        # 3. Sektor default (fallback akhir)
+        return {
+            "per": sector_per,
+            "pbv": 2.0,
+            "method": "sektor_default",
+            "years_used": len(pbvs),
+            "assumptions": None,
+        }
+
     def calculate_fundamental(
         self,
         financial_data_list: List[FinancialData],
@@ -256,10 +333,12 @@ class CalculatorEngine:
             v.pbv = round(current_price / metrics.bvps, 2)
 
         # Dividend Yield
-        if dividend_yield:
-            v.dividend_yield = round(dividend_yield, 2)
-        elif metrics.dps and current_price > 0:
+        # Prioritas: hitung sendiri dari DPS ÷ Harga (paling andal & konsisten).
+        # Nilai yfinance hanya dipakai sebagai fallback jika DPS tidak tersedia.
+        if metrics.dps and current_price > 0:
             v.dividend_yield = round((metrics.dps / current_price) * 100, 2)
+        elif dividend_yield:
+            v.dividend_yield = round(dividend_yield, 2)
 
         # Market Cap
         if market_cap:

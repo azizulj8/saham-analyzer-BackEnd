@@ -87,31 +87,64 @@ async def analyze_stock(
 
     corporate_actions = await market_data_svc.get_corporate_actions(ticker)
     dividends = corporate_actions.get("dividends", [])
-    latest_dps = dividends[-1]["amount"] if dividends else 0
+    # DPS = TOTAL dividen 12 bulan terakhir (interim + final), bukan satu pembayaran saja.
+    # Banyak emiten (mis. BBCA) bayar dua kali setahun; ambil yang terakhir saja
+    # akan membuat DPS & dividend yield terlalu kecil.
+    _cutoff = datetime.now() - __import__("datetime").timedelta(days=365)
+    _ttm = [
+        d["amount"] for d in dividends
+        if datetime.fromisoformat(d["date"]) >= _cutoff
+    ]
+    latest_dps = sum(_ttm) if _ttm else (dividends[-1]["amount"] if dividends else 0)
     historical_per, historical_pbv = await market_data_svc.get_historical_per_pbv(ticker)
 
     # 4. Coba fetch PDF dari IDX dan parse
     financial_data_list = []
     pdf_text_latest = ""
     data_source_label = "Yahoo Finance (harga pasar)"
+    extraction_method = "none"  # "llm" | "regex" | "none"
+
+    def _parse_pdf(pdf_path: str, yr: int):
+        """Ekstrak data keuangan dari 1 PDF.
+        Prioritas: ekstraksi via Claude (lebih andal) → fallback parser regex.
+        Mengembalikan (FinancialData|None, pdf_text, method)."""
+        pdf_text = pdf_parser.extract_text_for_llm(pdf_path)
+        # Coba LLM dulu
+        if llm_analyzer.is_available() and pdf_text:
+            fd_llm = llm_analyzer.extract_financial_data(
+                pdf_text=pdf_text,
+                ticker=ticker,
+                company_name=company_name,
+                sector=sector,
+                year=yr,
+                shares_outstanding=shares_outstanding,
+            )
+            if fd_llm and fd_llm.laba_rugi.net_profit and fd_llm.neraca.total_assets:
+                return fd_llm, pdf_text, "llm"
+            logger.warning(f"Ekstraksi LLM gagal untuk {ticker} {yr}, fallback ke parser regex.")
+        # Fallback parser regex
+        fd_regex = pdf_parser.parse(
+            pdf_path=pdf_path,
+            ticker=ticker,
+            year=yr,
+            company_name=company_name,
+            sector=sector,
+            shares_outstanding=shares_outstanding,
+        )
+        return fd_regex, pdf_text, ("regex" if fd_regex else "none")
 
     # Coba cari PDF di cache dulu (termasuk manual upload)
     for yr in range(datetime.now().year, datetime.now().year - 3, -1):
         cached_pdf = idx_fetcher.get_cached_pdf(ticker, yr)
         if cached_pdf:
             logger.info(f"PDF ditemukan di cache untuk {ticker} {yr}: {cached_pdf}")
-            fd = pdf_parser.parse(
-                pdf_path=cached_pdf,
-                ticker=ticker,
-                year=yr,
-                company_name=company_name,
-                sector=sector,
-                shares_outstanding=shares_outstanding,
-            )
+            fd, pdf_text, method = _parse_pdf(cached_pdf, yr)
             if fd:
                 financial_data_list.append(fd)
+                if method == "llm" or extraction_method == "none":
+                    extraction_method = method
                 if not pdf_text_latest:
-                    pdf_text_latest = pdf_parser.extract_text_for_llm(cached_pdf)
+                    pdf_text_latest = pdf_text
 
     # Jika tidak ada di cache, coba download dari IDX
     if not financial_data_list:
@@ -120,18 +153,13 @@ async def analyze_stock(
             pdf_reports = await idx_fetcher.get_multi_year_reports(ticker, years=min(years, 3))
 
             for pdf_path, year in pdf_reports:
-                fd = pdf_parser.parse(
-                    pdf_path=pdf_path,
-                    ticker=ticker,
-                    year=year,
-                    company_name=company_name,
-                    sector=sector,
-                    shares_outstanding=shares_outstanding,
-                )
+                fd, pdf_text, method = _parse_pdf(pdf_path, year)
                 if fd:
-                    financial_data_list.append(fd)
+                    if method == "llm" or extraction_method == "none":
+                        extraction_method = method
                     if not pdf_text_latest:
-                        pdf_text_latest = pdf_parser.extract_text_for_llm(pdf_path)
+                        pdf_text_latest = pdf_text
+                    financial_data_list.append(fd)
 
         except Exception as e:
             logger.warning(f"IDX PDF fetch gagal untuk {ticker}: {e}")
@@ -139,13 +167,18 @@ async def analyze_stock(
     # Tentukan mode analisis berdasarkan data yang tersedia
     has_pdf_data = len(financial_data_list) > 0
     if has_pdf_data:
-        data_source_label = "IDX (Laporan Keuangan Resmi) + Yahoo Finance"
+        _method_label = "ekstraksi Claude" if extraction_method == "llm" else "parser regex"
+        data_source_label = f"IDX (Laporan Keuangan Resmi, {_method_label}) + Yahoo Finance"
         logger.info(f"✅ Data PDF tersedia untuk {ticker}: {len(financial_data_list)} tahun")
     else:
         logger.warning(
             f"⚠️ PDF IDX tidak tersedia untuk {ticker}. "
             f"Menggunakan data Yahoo Finance sebagai fallback."
         )
+
+    # Snapshot data PDF mentah SEBELUM safety-net reset (untuk pemetaan/diagnosa)
+    raw_pdf_snapshot = list(financial_data_list)
+    fundamental_fallback_used = False
 
     # 5. Hitung metrik fundamental
     if has_pdf_data:
@@ -154,11 +187,12 @@ async def analyze_stock(
             shares_outstanding=shares_outstanding,
             dividends_per_share=latest_dps,
         )
-        
+
         # SAFETY NET: Jika ekstraksi PDF gagal murni (seperti saat baca interim report atau format tidak standar),
         # EPS dan BVPS biasanya bernilai 0. Kita tambal metrik kunci menggunakan data Yahoo Finance agar valuasi tidak rusak.
         if (metrics.eps is None or metrics.eps == 0) and (metrics.bvps is None or metrics.bvps == 0):
             logger.warning(f"Ekstraksi PDF gagal untuk {ticker} (EPS=0). Menimpa dengan data Yahoo Finance!")
+            fundamental_fallback_used = True
             yfinance_metrics = _build_metrics_from_yfinance(market, latest_dps, current_price)
             metrics.eps = yfinance_metrics.eps
             metrics.bvps = yfinance_metrics.bvps
@@ -176,13 +210,36 @@ async def analyze_stock(
         # FALLBACK: gunakan data dari Yahoo Finance
         metrics = _build_metrics_from_yfinance(market, latest_dps, current_price)
 
-    # 6. Hitung metrik valuasi
+    # 6. Tentukan baseline PER/PBV historis (opsi C: historis emiten → ROE-justified → sektor)
+    year_end_prices = {}
+    try:
+        hist_prices = await market_data_svc.get_historical_prices(ticker, period="5y")
+        if hist_prices and hist_prices.get("dates"):
+            for dstr, close in zip(hist_prices["dates"], hist_prices["closes"]):
+                yr = int(dstr[:4])
+                year_end_prices[yr] = close  # close terakhir per tahun (data terurut menaik)
+    except Exception as e:
+        logger.warning(f"Gagal ambil harga historis untuk baseline {ticker}: {e}")
+
+    baseline = calculator.compute_valuation_baseline(
+        financial_data_list=raw_pdf_snapshot,
+        year_end_prices=year_end_prices,
+        metrics=metrics,
+        shares_outstanding=shares_outstanding,
+        sector_per=historical_per,
+    )
+    logger.info(
+        f"Baseline valuasi {ticker}: PER={baseline['per']}, PBV={baseline['pbv']}, "
+        f"metode={baseline['method']} ({baseline['years_used']} tahun)"
+    )
+
+    # 7. Hitung metrik valuasi
     valuasi = calculator.calculate_valuasi(
         metrics=metrics,
         current_price=current_price,
         shares_outstanding=shares_outstanding,
-        historical_per=historical_per,
-        historical_pbv=historical_pbv,
+        historical_per=baseline["per"],
+        historical_pbv=baseline["pbv"],
         price_52w_high=market.get("price_52w_high"),
         price_52w_low=market.get("price_52w_low"),
         market_cap=market.get("market_cap"),
@@ -252,6 +309,17 @@ async def analyze_stock(
     result_dict = result.model_dump(mode="json")
     result_dict["has_pdf_data"] = has_pdf_data
     result_dict["pdf_years"] = [fd.year for fd in financial_data_list]
+    result_dict["data_trace"] = _build_data_trace(
+        market=market,
+        raw_pdf_list=raw_pdf_snapshot,
+        metrics=metrics,
+        valuasi=valuasi,
+        latest_dps=latest_dps,
+        current_price=current_price,
+        fundamental_fallback_used=fundamental_fallback_used,
+        extraction_method=extraction_method,
+        baseline=baseline,
+    )
 
     # Cache hasil
     await save_analysis_cache(ticker, result_dict)
@@ -316,6 +384,227 @@ def _build_metrics_from_yfinance(market: dict, dps: float, current_price: float)
     )
 
     return metrics
+
+
+def _build_data_trace(
+    market: dict,
+    raw_pdf_list: list,
+    metrics,
+    valuasi,
+    latest_dps: float,
+    current_price: float,
+    fundamental_fallback_used: bool,
+    extraction_method: str = "none",
+    baseline: dict = None,
+) -> dict:
+    """
+    Bangun pemetaan data per-metrik untuk diagnosa:
+    untuk tiap angka penting, tampilkan nilai MENTAH dari Yahoo Finance,
+    nilai MENTAH dari PDF upload (laporan keuangan), formula, hasil akhir,
+    sumber yang benar-benar dipakai, dan catatan anomali jika ada.
+
+    Tujuan: pengguna bisa langsung tahu apakah angka aneh berasal dari
+    data Yahoo Finance, dari ekstraksi PDF, atau dari rumus perhitungan.
+    """
+    # Data PDF mentah tahun terbaru (jika ada)
+    latest_pdf = raw_pdf_list[0] if raw_pdf_list else None
+    lr = latest_pdf.laba_rugi if latest_pdf else None
+    nr = latest_pdf.neraca if latest_pdf else None
+    pdf_year = latest_pdf.year if latest_pdf else None
+    pdf_ok = bool(raw_pdf_list)
+
+    def g(obj, attr):
+        return getattr(obj, attr, None) if obj else None
+
+    rows = [
+        {
+            "metric": "Harga Pasar",
+            "yfinance": current_price,
+            "pdf": None,
+            "formula": "current_price (fast_info / .info)",
+            "final": valuasi.current_price,
+            "source_used": "Yahoo Finance",
+            "note": None,
+        },
+        {
+            "metric": "EPS (Laba per Saham)",
+            "yfinance": round(current_price / market["per_trailing"], 2) if market.get("per_trailing") else None,
+            "pdf": f"net_profit={g(lr,'net_profit')} ÷ shares" if pdf_ok else None,
+            "formula": "PDF: Laba Bersih ÷ Saham Beredar | yfinance: Harga ÷ trailingPE",
+            "final": metrics.eps,
+            "source_used": "Yahoo Finance (PDF gagal)" if fundamental_fallback_used else "PDF",
+            "note": "EPS hasil ekstraksi PDF = 0 → ditimpa estimasi yfinance" if fundamental_fallback_used else None,
+        },
+        {
+            "metric": "BVPS (Nilai Buku per Saham)",
+            "yfinance": round(current_price / market["pbv"], 2) if market.get("pbv") else None,
+            "pdf": f"total_equity={g(nr,'total_equity')} ÷ shares" if pdf_ok else None,
+            "formula": "PDF: Ekuitas ÷ Saham Beredar | yfinance: Harga ÷ priceToBook",
+            "final": metrics.bvps,
+            "source_used": "Yahoo Finance (PDF gagal)" if fundamental_fallback_used else "PDF",
+            "note": None,
+        },
+        {
+            "metric": "PER",
+            "yfinance": market.get("per_trailing"),
+            "pdf": None,
+            "formula": "Harga ÷ EPS",
+            "final": valuasi.per,
+            "source_used": "Perhitungan (Harga ÷ EPS)",
+            "note": None,
+        },
+        {
+            "metric": "PBV",
+            "yfinance": market.get("pbv"),
+            "pdf": None,
+            "formula": "Harga ÷ BVPS",
+            "final": valuasi.pbv,
+            "source_used": "Perhitungan (Harga ÷ BVPS)",
+            "note": None,
+        },
+        {
+            "metric": "DPS (Dividen per Saham)",
+            "yfinance": latest_dps,
+            "pdf": None,
+            "formula": "Dividen terakhir dari corporate actions",
+            "final": metrics.dps,
+            "source_used": "Yahoo Finance (corporate actions)",
+            "note": None,
+        },
+        {
+            "metric": "Dividend Yield",
+            "yfinance": market.get("dividend_yield"),
+            "pdf": None,
+            "formula": "Dihitung sendiri: DPS ÷ Harga × 100 (yfinance hanya fallback)",
+            "final": valuasi.dividend_yield,
+            "source_used": (
+                "Perhitungan (DPS÷Harga)" if (latest_dps and current_price) else "Yahoo Finance"
+            ),
+            "note": (
+                f"⚠️ ANOMALI: nilai akhir ({valuasi.dividend_yield}%) terlalu besar — periksa konversi yfinance."
+                if (valuasi.dividend_yield or 0) > 100 else None
+            ),
+        },
+        {
+            "metric": "ROE",
+            "yfinance": round(market["roe"] * 100, 2) if market.get("roe") is not None else None,
+            "pdf": f"net_profit ÷ total_equity ({g(lr,'net_profit')} ÷ {g(nr,'total_equity')})" if pdf_ok else None,
+            "formula": "Laba Bersih ÷ Ekuitas × 100",
+            "final": metrics.roe,
+            "source_used": "Yahoo Finance (PDF gagal)" if fundamental_fallback_used else "PDF",
+            "note": None,
+        },
+        {
+            "metric": "DER (Debt-to-Equity)",
+            "yfinance": round(market["debt_to_equity"] / 100, 2) if market.get("debt_to_equity") is not None else None,
+            "pdf": f"total_liabilities ÷ total_equity ({g(nr,'total_liabilities')} ÷ {g(nr,'total_equity')})" if pdf_ok else None,
+            "formula": "Total Liabilitas ÷ Ekuitas",
+            "final": metrics.debt_to_equity,
+            "source_used": "Yahoo Finance (PDF gagal)" if fundamental_fallback_used else "PDF",
+            "note": None,
+        },
+        {
+            "metric": "CASA Ratio",
+            "yfinance": None,
+            "pdf": f"casa={g(nr,'casa')}, casa_ratio={g(nr,'casa_ratio')}, total_assets={g(nr,'total_assets')}" if pdf_ok else None,
+            "formula": "CASA ÷ Total Aset × 100",
+            "final": metrics.casa_ratio,
+            "source_used": "PDF (laporan keuangan)",
+            "note": "⚠️ ANOMALI: nilai negatif — kemungkinan salah ekstraksi pos CASA dari PDF" if (metrics.casa_ratio or 0) < 0 else None,
+        },
+        {
+            "metric": "LDR (Loan-to-Deposit)",
+            "yfinance": None,
+            "pdf": f"total_loans={g(nr,'total_loans')}, total_liabilities={g(nr,'total_liabilities')}" if pdf_ok else None,
+            "formula": "Total Kredit ÷ Total Liabilitas × 100",
+            "final": metrics.loan_to_deposit,
+            "source_used": "PDF (laporan keuangan)",
+            "note": "⚠️ ANOMALI: 0 — pos Total Kredit gagal terbaca dari PDF" if (metrics.loan_to_deposit == 0) else None,
+        },
+        {
+            "metric": "Market Cap",
+            "yfinance": market.get("market_cap"),
+            "pdf": None,
+            "formula": "market_cap (yfinance)",
+            "final": valuasi.market_cap,
+            "source_used": "Yahoo Finance",
+            "note": None,
+        },
+        {
+            "metric": "52W High / Low",
+            "yfinance": f"{market.get('price_52w_high')} / {market.get('price_52w_low')}",
+            "pdf": None,
+            "formula": "year_high / year_low (yfinance)",
+            "final": f"{valuasi.price_52w_high} / {valuasi.price_52w_low}",
+            "source_used": "Yahoo Finance",
+            "note": None,
+        },
+    ]
+
+    # ── Guard konsistensi (deteksi salah baris / inkonsistensi antar tahun) ──
+    consistency_warnings = []
+
+    # 1. Identitas neraca: Total Aset ≈ Total Liabilitas + Total Ekuitas
+    if pdf_ok and nr and nr.total_assets and nr.total_liabilities and nr.total_equity:
+        diff = abs(nr.total_assets - (nr.total_liabilities + nr.total_equity))
+        if nr.total_assets and (diff / nr.total_assets) > 0.05:
+            consistency_warnings.append(
+                f"⚠️ Neraca tidak balance: Total Aset ({nr.total_assets:,.0f}) ≠ "
+                f"Liabilitas + Ekuitas ({nr.total_liabilities + nr.total_equity:,.0f}) — "
+                f"selisih {diff / nr.total_assets * 100:.1f}%. Kemungkinan salah ambil baris."
+            )
+
+    # 2. Divergensi YoY: laba & pendapatan bunga seharusnya searah.
+    if len(raw_pdf_list) >= 2:
+        cur, prev = raw_pdf_list[0], raw_pdf_list[1]
+
+        def yoy(c, p):
+            if c is None or p is None or p == 0:
+                return None
+            return (c - p) / abs(p) * 100
+
+        np_yoy = yoy(cur.laba_rugi.net_profit, prev.laba_rugi.net_profit)
+        ii_yoy = yoy(cur.laba_rugi.interest_income, prev.laba_rugi.interest_income)
+        if np_yoy is not None and ii_yoy is not None:
+            if (np_yoy > 0) != (ii_yoy > 0) and abs(np_yoy - ii_yoy) > 10:
+                consistency_warnings.append(
+                    f"⚠️ Arah laba ({np_yoy:+.1f}% YoY) dan pendapatan bunga ({ii_yoy:+.1f}% YoY) "
+                    f"berlawanan — kemungkinan angka pendapatan bunga antar tahun tidak konsisten "
+                    f"(bruto vs bersih). Periksa sebelum mengandalkan skor pertumbuhan."
+                )
+
+    return {
+        "pdf_extraction_ok": pdf_ok and not fundamental_fallback_used,
+        "fundamental_fallback_used": fundamental_fallback_used,
+        "extraction_method": extraction_method,
+        "consistency_warnings": consistency_warnings,
+        "valuation_baseline": baseline,
+        "pdf_year": pdf_year,
+        "raw_yfinance": {
+            "current_price": market.get("current_price"),
+            "per_trailing": market.get("per_trailing"),
+            "per_forward": market.get("per_forward"),
+            "pbv": market.get("pbv"),
+            "dividend_yield": market.get("dividend_yield"),
+            "roe": market.get("roe"),
+            "roa": market.get("roa"),
+            "debt_to_equity": market.get("debt_to_equity"),
+            "market_cap": market.get("market_cap"),
+            "shares_outstanding": market.get("shares_outstanding"),
+        },
+        "raw_pdf_latest": {
+            "year": pdf_year,
+            "net_profit": g(lr, "net_profit"),
+            "revenue": g(lr, "revenue"),
+            "interest_income": g(lr, "interest_income"),
+            "total_assets": g(nr, "total_assets"),
+            "total_equity": g(nr, "total_equity"),
+            "total_liabilities": g(nr, "total_liabilities"),
+            "total_loans": g(nr, "total_loans"),
+            "casa": g(nr, "casa"),
+        } if pdf_ok else None,
+        "rows": rows,
+    }
 
 
 @router.get("/health")

@@ -576,6 +576,14 @@ class ScorerEngine:
 
         alasan = []
 
+        # Cek apakah harga sudah di area beli ideal (80-92% fair value konservatif)
+        price_in_buy_zone = False
+        if valuasi.fair_value_conservative and valuasi.current_price:
+            fv_cons = valuasi.fair_value_conservative
+            area_beli_bawah = fv_cons * 0.80
+            area_beli_atas = fv_cons * 0.92
+            price_in_buy_zone = area_beli_bawah <= valuasi.current_price <= area_beli_atas
+
         # LEWATI: Fundamental sangat buruk
         if fund_score < 4.0:
             alasan.append(f"Skor fundamental rendah ({fund_score}/10)")
@@ -589,16 +597,6 @@ class ScorerEngine:
             alasan.append("Risiko bisnis dan keuangan sama-sama tinggi")
             return KeputusanEnum.LEWATI, alasan
 
-        # TUNGGU: Fundamental bagus tapi harga mahal
-        if fund_score >= 7.0 and mos < 5:
-            alasan.append(f"Bisnis bagus (skor {fund_score}/10) tapi harga di atas nilai wajar")
-            if valuasi.fair_value_conservative:
-                alasan.append(
-                    f"Target beli: Rp{valuasi.fair_value_conservative * 0.9:,.0f} "
-                    f"atau lebih rendah"
-                )
-            return KeputusanEnum.TUNGGU, alasan
-
         # BELI: Fundamental kuat + harga sangat murah
         if fund_score >= 7.0 and mos >= 25 and risiko.overall != RisikoLevel.TINGGI:
             alasan.append(f"Fundamental sangat kuat ({fund_score}/10)")
@@ -607,9 +605,11 @@ class ScorerEngine:
             return KeputusanEnum.BELI, alasan
 
         # CICIL BELI: Fundamental bagus + harga cukup menarik
-        if fund_score >= 6.5 and mos >= 10 and risiko.overall != RisikoLevel.TINGGI:
+        if fund_score >= 6.0 and mos >= 10 and risiko.overall != RisikoLevel.TINGGI:
             alasan.append(f"Fundamental baik ({fund_score}/10)")
             alasan.append(f"Margin of Safety: {mos:.1f}% — cukup menarik")
+            if price_in_buy_zone:
+                alasan.append("Harga sudah berada di Area Beli Ideal")
             alasan.append("Rekomendasi: cicil beli untuk rata-rata harga")
             return KeputusanEnum.CICIL_BELI, alasan
 
@@ -618,6 +618,23 @@ class ScorerEngine:
             alasan.append(f"Harga sangat murah (MoS {mos:.1f}%)")
             alasan.append("Cicil dengan posisi kecil sambil pantau fundamental")
             return KeputusanEnum.CICIL_BELI, alasan
+
+        # CICIL BELI: Harga sudah di buy zone + fundamental cukup baik
+        if price_in_buy_zone and fund_score >= 5.0 and risiko.overall != RisikoLevel.TINGGI:
+            alasan.append(f"Harga sudah di Area Beli Ideal (Rp{area_beli_bawah:,.0f} - Rp{area_beli_atas:,.0f})")
+            alasan.append(f"Fundamental cukup ({fund_score}/10), MoS: {mos:.1f}%")
+            alasan.append("Rekomendasi: cicil beli di area ini")
+            return KeputusanEnum.CICIL_BELI, alasan
+
+        # TUNGGU: Fundamental bagus tapi harga masih mahal
+        if fund_score >= 7.0 and mos < 5:
+            alasan.append(f"Bisnis bagus (skor {fund_score}/10) tapi harga di atas nilai wajar")
+            if valuasi.fair_value_conservative:
+                alasan.append(
+                    f"Target beli: Rp{valuasi.fair_value_conservative * 0.9:,.0f} "
+                    f"atau lebih rendah"
+                )
+            return KeputusanEnum.TUNGGU, alasan
 
         # Default: TUNGGU
         if fund_score >= 5.0:
