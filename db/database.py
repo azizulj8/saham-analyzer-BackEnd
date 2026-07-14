@@ -49,6 +49,21 @@ class WatchlistDB(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class FinancialExtractCache(Base):
+    """Cache hasil ekstraksi data keuangan dari PDF (via LLM).
+    Ekstraksi deterministik (temperature=0), jadi valid selama isi PDF sama —
+    di-key dengan hash konten PDF agar upload PDF baru otomatis invalidasi."""
+    __tablename__ = "financial_extract_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(20), index=True)
+    year: Mapped[int] = mapped_column(Integer)
+    pdf_hash: Mapped[str] = mapped_column(String(64), index=True)
+    method: Mapped[str] = mapped_column(String(10), default="llm")  # llm | regex
+    financial_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class PDFRecord(Base):
     """Record PDF yang sudah didownload/diupload"""
     __tablename__ = "pdf_records"
@@ -128,6 +143,49 @@ async def clear_analysis_cache(ticker: str):
         )
         await session.commit()
         logger.info(f"Cache invalidated untuk {ticker}")
+
+
+async def get_financial_extract(ticker: str, year: int, pdf_hash: str) -> Optional[dict]:
+    """Ambil hasil ekstraksi keuangan dari cache (match hash konten PDF)."""
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(FinancialExtractCache)
+            .where(FinancialExtractCache.ticker == ticker.upper())
+            .where(FinancialExtractCache.year == year)
+            .where(FinancialExtractCache.pdf_hash == pdf_hash)
+            .order_by(FinancialExtractCache.created_at.desc())
+            .limit(1)
+        )
+        cached = result.scalar_one_or_none()
+        if cached:
+            logger.info(f"Extract cache hit: {ticker} {year} ({cached.method})")
+            return {"method": cached.method, "data": json.loads(cached.financial_json)}
+    return None
+
+
+async def save_financial_extract(
+    ticker: str, year: int, pdf_hash: str, method: str, financial_data: dict
+):
+    """Simpan hasil ekstraksi keuangan ke cache (hapus entri lama untuk kombinasi sama)."""
+    from sqlalchemy import delete
+
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            delete(FinancialExtractCache)
+            .where(FinancialExtractCache.ticker == ticker.upper())
+            .where(FinancialExtractCache.year == year)
+        )
+        session.add(FinancialExtractCache(
+            ticker=ticker.upper(),
+            year=year,
+            pdf_hash=pdf_hash,
+            method=method,
+            financial_json=json.dumps(financial_data, default=str),
+        ))
+        await session.commit()
+        logger.info(f"Extract cache saved: {ticker} {year} ({method})")
 
 
 async def get_watchlist() -> list:

@@ -231,20 +231,8 @@ class PDFParser:
             neraca = self._extract_neraca(all_text, all_tables, year)
             arus_kas = self._extract_arus_kas(all_text, all_tables, year)
 
-            # MANUAL OVERRIDE UNTUK MDKA (Memperbaiki distorsi tabel PDF dan Atribusi Laba Induk)
-            if ticker == "MDKA":
-                if year == 2025:
-                    laba_rugi.net_profit = -62060000.0
-                    laba_rugi.revenue = 1890000000.0
-                    neraca.total_equity = 791000000.0
-                elif year == 2024:
-                    laba_rugi.net_profit = -55760000.0
-                    laba_rugi.revenue = 2240000000.0
-
             # Deteksi mata uang
             is_usd = self._detect_currency(all_text)
-            if ticker == "MDKA":
-                is_usd = True
             exchange_rate = 1.0
             if is_usd:
                 exchange_rate = self._get_dynamic_exchange_rate(year)

@@ -48,10 +48,13 @@ async def analyze_stock(
 ):
     ticker = ticker.upper().strip()
 
-    # 1. Cek cache
+    # 1. Cek cache — fundamental boleh dari cache (stabil, mahal dihitung),
+    #    tapi HARGA selalu di-refresh (murah & berubah tiap menit) beserta
+    #    semua metrik turunan harga (PER, PBV, MoS, skor valuasi, keputusan).
     if not force_refresh:
         cached = await get_cached_analysis(ticker)
         if cached:
+            cached = await _refresh_price_dependent(ticker, cached)
             cached["from_cache"] = True
             return cached
 
@@ -104,12 +107,29 @@ async def analyze_stock(
     data_source_label = "Yahoo Finance (harga pasar)"
     extraction_method = "none"  # "llm" | "regex" | "none"
 
-    def _parse_pdf(pdf_path: str, yr: int):
+    async def _parse_pdf(pdf_path: str, yr: int):
         """Ekstrak data keuangan dari 1 PDF.
-        Prioritas: ekstraksi via Claude (lebih andal) → fallback parser regex.
+        Prioritas: cache ekstraksi (hash PDF) → Claude → fallback parser regex.
         Mengembalikan (FinancialData|None, pdf_text, method)."""
+        import hashlib
+        from models.schemas import FinancialData
+        from db.database import get_financial_extract, save_financial_extract
+
         pdf_text = pdf_parser.extract_text_for_llm(pdf_path)
-        # Coba LLM dulu
+
+        # 0. Cek cache ekstraksi — ekstraksi deterministik, valid selama isi PDF sama
+        pdf_hash = ""
+        try:
+            with open(pdf_path, "rb") as fh:
+                pdf_hash = hashlib.sha256(fh.read()).hexdigest()
+            cached_extract = await get_financial_extract(ticker, yr, pdf_hash)
+            if cached_extract:
+                fd_cached = FinancialData(**cached_extract["data"])
+                return fd_cached, pdf_text, cached_extract["method"]
+        except Exception as e:
+            logger.warning(f"Extract cache gagal untuk {ticker} {yr}: {e}")
+
+        # 1. Coba LLM dulu
         if llm_analyzer.is_available() and pdf_text:
             fd_llm = llm_analyzer.extract_financial_data(
                 pdf_text=pdf_text,
@@ -120,9 +140,16 @@ async def analyze_stock(
                 shares_outstanding=shares_outstanding,
             )
             if fd_llm and fd_llm.laba_rugi.net_profit and fd_llm.neraca.total_assets:
+                if pdf_hash:
+                    try:
+                        await save_financial_extract(
+                            ticker, yr, pdf_hash, "llm", fd_llm.model_dump(mode="json")
+                        )
+                    except Exception as e:
+                        logger.warning(f"Gagal simpan extract cache {ticker} {yr}: {e}")
                 return fd_llm, pdf_text, "llm"
             logger.warning(f"Ekstraksi LLM gagal untuk {ticker} {yr}, fallback ke parser regex.")
-        # Fallback parser regex
+        # Fallback parser regex (tidak di-cache — kualitasnya rendah, biar dicoba LLM lagi nanti)
         fd_regex = pdf_parser.parse(
             pdf_path=pdf_path,
             ticker=ticker,
@@ -138,7 +165,7 @@ async def analyze_stock(
         cached_pdf = idx_fetcher.get_cached_pdf(ticker, yr)
         if cached_pdf:
             logger.info(f"PDF ditemukan di cache untuk {ticker} {yr}: {cached_pdf}")
-            fd, pdf_text, method = _parse_pdf(cached_pdf, yr)
+            fd, pdf_text, method = await _parse_pdf(cached_pdf, yr)
             if fd:
                 financial_data_list.append(fd)
                 if method == "llm" or extraction_method == "none":
@@ -153,7 +180,7 @@ async def analyze_stock(
             pdf_reports = await idx_fetcher.get_multi_year_reports(ticker, years=min(years, 3))
 
             for pdf_path, year in pdf_reports:
-                fd, pdf_text, method = _parse_pdf(pdf_path, year)
+                fd, pdf_text, method = await _parse_pdf(pdf_path, year)
                 if fd:
                     if method == "llm" or extraction_method == "none":
                         extraction_method = method
@@ -333,6 +360,62 @@ async def analyze_stock(
     )
 
     return result_dict
+
+
+async def _refresh_price_dependent(ticker: str, cached: dict) -> dict:
+    """
+    Refresh harga terkini + semua metrik turunan harga pada hasil cache.
+    Fundamental (EPS, BVPS, ROE, dll.) tetap dari cache — hanya valuasi,
+    skor valuasi, dan keputusan yang dihitung ulang dengan harga baru.
+    Jika fetch harga gagal, kembalikan cache apa adanya.
+    """
+    try:
+        fresh_price = await market_data_svc.get_current_price(ticker)
+        if not fresh_price or fresh_price <= 0:
+            return cached
+
+        old_price = (cached.get("valuasi") or {}).get("current_price")
+        if old_price and abs(fresh_price - old_price) / old_price < 0.001:
+            return cached  # harga tidak berubah berarti
+
+        from models.schemas import FundamentalMetrics, ValuasiMetrics
+
+        metrics = FundamentalMetrics(**cached.get("fundamental", {}))
+        old_val = cached.get("valuasi", {}) or {}
+
+        valuasi = calculator.calculate_valuasi(
+            metrics=metrics,
+            current_price=fresh_price,
+            historical_per=old_val.get("per_historical_avg") or 14.0,
+            historical_pbv=old_val.get("pbv_historical_avg") or 2.0,
+            price_52w_high=old_val.get("price_52w_high"),
+            price_52w_low=old_val.get("price_52w_low"),
+            market_cap=old_val.get("market_cap"),
+            dividend_yield=None,  # dihitung ulang dari DPS ÷ harga baru
+        )
+
+        valuasi_score = scorer.score_valuasi(valuasi)
+        from models.schemas import FundamentalScore
+        fundamental_score = FundamentalScore(**cached.get("fundamental_score", {}))
+        risiko = scorer.assess_risiko(metrics, valuasi, fundamental_score)
+        keputusan, _ = scorer.determine_keputusan(
+            fundamental_score, valuasi_score, valuasi, risiko
+        )
+        ab, aa, aj = scorer.calculate_buy_zones(valuasi)
+
+        cached["valuasi"] = valuasi.model_dump(mode="json")
+        cached["valuasi_score"] = valuasi_score.model_dump(mode="json")
+        cached["risiko"] = risiko.model_dump(mode="json")
+        cached["keputusan"] = keputusan.value
+        cached["area_beli_bawah"], cached["area_beli_atas"], cached["area_jual"] = ab, aa, aj
+        cached["price_refreshed"] = True
+        logger.info(
+            f"Harga {ticker} di-refresh pada cache hit: "
+            f"Rp{old_price or 0:,.0f} → Rp{fresh_price:,.0f}"
+        )
+    except Exception as e:
+        logger.warning(f"Gagal refresh harga untuk cache {ticker}: {e}")
+    return cached
 
 
 def _build_metrics_from_yfinance(market: dict, dps: float, current_price: float):
